@@ -35,4 +35,5 @@ dependencies = [
     "langgraph-checkpoint-postgres",   # Salva a memória do agente no PostgreSQL (checkpointer).
     "psycopg[binary]",                 # Driver para o Python conversar com o PostgreSQL.
     "python-dotenv",                   # Lê o arquivo .env e carrega os segredos em memória.
+    "requests>=2.34.2",               # Cliente HTTP para tools que chamam APIs (ex.: ViaCEP).
 ]

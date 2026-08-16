@@ -459,6 +459,86 @@ de salvar o histórico (Parte 3). Para rodar:
 uv run python agent.py
 ```
 
+### 2.6 Controle de memória (resumir conversas longas)
+
+#### O que é a "janela de contexto" e por que conversa longa é um problema
+
+O modelo **não tem memória própria**. A cada mensagem sua, o programa reenvia
+**todo o histórico** da conversa junto — é assim que ele "lembra". Mas todo
+modelo tem um limite de quanto texto consegue ler de uma vez, chamado **janela
+de contexto** (medida em **tokens** — pedaços de palavra; grosso modo, ~4
+caracteres = 1 token).
+
+Numa conversa longa, o histórico cresce sem parar. Isso traz três problemas:
+
+1. **Estouro**: se o histórico passar da janela de contexto, o modelo dá erro.
+2. **Custo**: você paga por token enviado; histórico gigante = conta alta.
+3. **Lentidão**: mais texto para ler = resposta mais lenta.
+
+#### O que o middleware faz
+
+Um **middleware** é um "meio de campo": um componente que fica **entre** você e
+o modelo e pode agir automaticamente a cada rodada. O
+**`SummarizationMiddleware`** vigia o tamanho do histórico e, quando ele passa
+de um limite, **resume** as mensagens antigas em um texto curto (usando o próprio
+modelo para escrever o resumo) e continua a conversa com esse resumo no lugar do
+histórico gigante. Você não perde o "fio da meada", mas gasta muito menos espaço.
+
+#### Resumir por tokens ou por número de mensagens?
+
+Nós deixamos **as duas estratégias no código** ao mesmo tempo; você escolhe pelo
+`.env` (sem mexer no código):
+
+- **Por tokens** (padrão, recomendado): resume quando o histórico passa de X
+  **tokens**. É a medida "real" que o modelo usa, então protege melhor contra o
+  estouro. Desvantagem: token é uma unidade menos intuitiva para humanos.
+- **Por mensagens** (alternativa): resume quando passam de N **mensagens**
+  (perguntas + respostas). É fácil de entender ("resuma a cada 40 mensagens"),
+  mas menos preciso — 40 mensagens curtas ocupam muito menos que 40 longas.
+
+> **Nota técnica (verificada na biblioteca instalada):** na versão atual do
+> LangChain, o `SummarizationMiddleware` usa **um único parâmetro `trigger`**,
+> que recebe uma tupla `(tipo, limite)` — `("tokens", 3000)` ou
+> `("messages", 40)`. Tutoriais antigos citam parâmetros separados como
+> `max_tokens_before_summary`; **isso mudou**. O nosso `if/elif` monta a tupla
+> `trigger` certa conforme a estratégia. Existe também o parâmetro `keep`
+> (padrão: manter as 20 mensagens mais recentes intactas após o resumo).
+
+#### Como eu troco de estratégia (editando só o `.env`)
+
+Três variáveis no [`.env`](.env.example) controlam tudo (todas opcionais — se
+faltarem, o código usa padrões):
+
+```bash
+ESTRATEGIA_MEMORIA=tokens     # "tokens" (padrão) ou "mensagens"
+MAX_TOKENS_RESUMO=3000        # usado quando a estratégia é "tokens"
+MAX_MENSAGENS_RESUMO=40       # usado quando a estratégia é "mensagens"
+```
+
+- Para usar a alternativa, mude **só** a primeira linha para
+  `ESTRATEGIA_MEMORIA=mensagens` e salve. Nada de mexer no `.py`.
+- Os valores numéricos chegam como **texto** do `.env`; no código eles são
+  convertidos para número inteiro com `int(...)` (por isso funcionam nas contas).
+
+No [`agent.py`](agent.py), o trecho que faz a escolha é o **bloco 6.1b**:
+
+```python
+if ESTRATEGIA_MEMORIA == "tokens":                # estratégia principal
+    gatilho = ("tokens", MAX_TOKENS_RESUMO)       # tupla (tipo, limite)
+elif ESTRATEGIA_MEMORIA == "mensagens":           # estratégia alternativa
+    gatilho = ("messages", MAX_MENSAGENS_RESUMO)  # note o "messages" em inglês
+else:                                             # valor inválido -> padrão seguro
+    gatilho = ("tokens", MAX_TOKENS_RESUMO)
+
+memoria_middleware = SummarizationMiddleware(     # cria o middleware
+    model=modelo,                                 # usa o MESMO modelo do agente
+    trigger=gatilho,                              # a regra de quando resumir
+)
+```
+
+E ele entra no agente pelo parâmetro `middleware=[memoria_middleware]` do
+`create_agent`.
+
 ---
 
 ## PARTE 3 — Ver as conversas de forma legível

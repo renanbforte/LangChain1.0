@@ -5,7 +5,9 @@
 #   - Lê segredos do .env (chaves de API e URL do banco).
 #   - Cria o modelo de linguagem (gpt-3.5-turbo, trocável por Gemini).
 #   - Dá ao agente uma personalidade (system_prompt).
-#   - Dá ao agente uma ferramenta de busca na web (Tavily).
+#   - Dá ao agente VÁRIAS tools (busca web + pacote tools/: CEP e temperatura).
+#   - Trata erros de qualquer tool num ponto central (middleware).
+#   - Resume conversas longas para não estourar a janela de contexto (middleware).
 #   - Guarda a memória do agente no PostgreSQL (checkpointer).
 #   - Salva o histórico em TEXTO LIMPO nas suas próprias tabelas.
 #   - Roda um loop de conversa pelo terminal.
@@ -25,6 +27,10 @@ from dotenv import load_dotenv         # Função que lê o arquivo .env e joga 
 # create_agent: a função do LangChain 1.0 que monta um agente pronto para uso.
 from langchain.agents import create_agent
 
+# SummarizationMiddleware: um "meio de campo" que RESUME conversas longas
+# automaticamente, para não estourar a janela de contexto do modelo (ver README).
+from langchain.agents.middleware import SummarizationMiddleware
+
 # TavilySearch: a ferramenta (tool) que faz busca na web.
 from langchain_tavily import TavilySearch
 
@@ -34,6 +40,12 @@ from langgraph.checkpoint.postgres import PostgresSaver
 # psycopg: o driver que permite ao Python conversar diretamente com o PostgreSQL
 #          (usado para salvar o histórico nas NOSSAS tabelas de texto limpo).
 import psycopg
+
+# O NOSSO pacote de tools (a pasta tools/). Importamos só a "vitrine":
+#   TOOLS                -> a lista com todas as tools do projeto (CEP, temperatura...).
+#   tratar_erros_de_tool -> o middleware que trata erros de QUALQUER tool num lugar só.
+# Repare como o agente não sabe em quais arquivos as tools moram — só usa a vitrine.
+from tools import TOOLS, tratar_erros_de_tool
 
 
 # -----------------------------------------------------------------------------
@@ -49,23 +61,51 @@ load_dotenv()
 # Se ela não existir, o programa para com erro claro (bom para não rodar sem banco).
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+# --- Configuração do controle de memória (sumarização de conversas longas) ---
+# Diferença importante entre os.environ[...] e os.getenv(...):
+#   os.environ["X"]      -> se X NÃO existir, o programa PARA com erro (obrigatória).
+#   os.getenv("X", pad)  -> se X não existir, usa o valor padrão "pad" (opcional).
+# Como estas três são OPCIONAIS (têm padrão), usamos os.getenv.
+
+# ESTRATEGIA_MEMORIA: como decidir a hora de resumir. Valores: "tokens" ou
+# "mensagens". Se não estiver no .env, o padrão é "tokens".
+ESTRATEGIA_MEMORIA = os.getenv("ESTRATEGIA_MEMORIA", "tokens")
+
+# Os valores do .env chegam SEMPRE como TEXTO (string). Como estes são números,
+# convertemos com int(...). Ex.: o texto "3000" vira o número 3000.
+# O 2º argumento do getenv é o padrão (também em texto) caso não esteja no .env.
+
+# MAX_TOKENS_RESUMO: usado na estratégia "tokens". Quando o histórico passar
+# desse tanto de tokens, o middleware resume. Padrão: 3000.
+MAX_TOKENS_RESUMO = int(os.getenv("MAX_TOKENS_RESUMO", "3000"))
+
+# MAX_MENSAGENS_RESUMO: usado na estratégia "mensagens". Quando o histórico
+# passar desse número de mensagens, o middleware resume. Padrão: 40.
+MAX_MENSAGENS_RESUMO = int(os.getenv("MAX_MENSAGENS_RESUMO", "40"))
+
 
 # -----------------------------------------------------------------------------
 # BLOCO 3 — AS FERRAMENTAS (TOOLS) DO AGENTE
 # -----------------------------------------------------------------------------
 # Uma "tool" é uma função que o agente PODE decidir chamar sozinho quando
-# achar que precisa. Ele não é obrigado — ele lê a sua pergunta e decide.
+# achar que precisa. Ele não é obrigado — ele lê a sua pergunta e decide qual
+# (ou nenhuma) usar. Aqui o agente terá VÁRIAS tools convivendo:
+#   - busca_web       -> busca na web (Tavily), definida aqui mesmo.
+#   - TOOLS           -> as tools do pacote tools/ (CEP e temperatura).
 #
 # TavilySearch faz uma busca na web e devolve os resultados.
 #   max_results=3  -> traz no máximo 3 resultados por busca (suficiente e barato).
 busca_web = TavilySearch(max_results=3)
 
-# A lista de tools que o agente terá disponível.
-# >>> PARA ADICIONAR UMA NOVA TOOL NO FUTURO: crie/importe a tool acima e
-# >>> simplesmente inclua ela nesta lista. Exemplo:
-# >>>     tools = [busca_web, minha_nova_tool, outra_tool]
-# O agente passa a considerar automaticamente todas as tools da lista.
-tools = [busca_web]
+# Montamos a lista FINAL de tools do agente.
+# O `*TOOLS` "desempacota" a lista do pacote: [busca_web, conversor..., buscar_cep].
+# Assim juntamos a tool local (busca_web) com todas as tools do pacote de uma vez.
+#
+# >>> PARA ADICIONAR UMA NOVA TOOL NO FUTURO:
+# >>>   - Se for uma tool "de verdade" (CEP, clima, cotação...), crie no pacote
+# >>>     tools/ e registre em tools/__init__.py -> ela entra sozinha pelo *TOOLS.
+# >>>   - Se for uma tool "de biblioteca" (como a Tavily), some ela aqui na lista.
+todas_as_tools = [busca_web, *TOOLS]
 
 
 # -----------------------------------------------------------------------------
@@ -75,8 +115,10 @@ tools = [busca_web]
 # como deve se comportar. Ele vale para a conversa inteira.
 SYSTEM_PROMPT = (
     "Você é um assistente prestativo e direto, que responde em português do Brasil. "
-    "Quando a pergunta envolver fatos atuais ou algo que você não tem certeza, "
-    "use a ferramenta de busca na web antes de responder."
+    "Você tem ferramentas para: buscar na web, converter temperaturas e consultar "
+    "endereços por CEP. Escolha a ferramenta certa para cada pedido; se nenhuma se "
+    "aplicar, responda com seu próprio conhecimento. Quando a pergunta envolver fatos "
+    "atuais ou algo de que você não tem certeza, use a busca na web antes de responder."
 )
 
 
@@ -159,6 +201,41 @@ def main():
     #   a de baixo (a chave GOOGLE_API_KEY precisa estar no .env).
     # modelo = "google_genai:gemini-1.5-flash"
 
+    # -- 6.1b  Controle de memória: sumarização de conversas longas ------------
+    # Toda vez que você conversa, TODO o histórico é reenviado ao modelo. Como o
+    # modelo tem um limite de texto por vez (a "janela de contexto"), uma conversa
+    # muito longa acabaria estourando esse limite (erro) ou ficando cara/lenta.
+    # O SummarizationMiddleware resolve isso: quando o histórico cresce demais,
+    # ele RESUME as mensagens antigas em um texto curto e continua a conversa.
+    #
+    # Escolhemos a estratégia pela variável ESTRATEGIA_MEMORIA (lida do .env),
+    # SEM comentar/descomentar código. O if/elif monta a tupla "gatilho" certa:
+    #   ("tokens", N)   -> resume quando o histórico passa de N tokens.
+    #   ("messages", N) -> resume quando o histórico passa de N mensagens.
+    if ESTRATEGIA_MEMORIA == "tokens":
+        # Estratégia principal (padrão): contar TOKENS (pedaços de texto).
+        gatilho = ("tokens", MAX_TOKENS_RESUMO)
+    elif ESTRATEGIA_MEMORIA == "mensagens":
+        # Estratégia alternativa: contar o NÚMERO de mensagens trocadas.
+        gatilho = ("messages", MAX_MENSAGENS_RESUMO)
+    else:
+        # Se a variável vier com um valor inesperado (ex.: erro de digitação),
+        # avisamos e caímos no padrão seguro (tokens), para o programa não quebrar.
+        print(f"[aviso] ESTRATEGIA_MEMORIA='{ESTRATEGIA_MEMORIA}' invalida; usando 'tokens'.")
+        gatilho = ("tokens", MAX_TOKENS_RESUMO)
+
+    # Cria o middleware de sumarização.
+    #   model=modelo  -> usa o MESMO modelo do agente para gerar os resumos
+    #                    (se você trocar para o Gemini lá em cima, o resumo também
+    #                    passa a usar o Gemini, automaticamente).
+    #   trigger=gatilho -> a regra de QUANDO resumir, montada no if/elif acima.
+    # (Existe ainda o parâmetro 'keep', que por padrão mantém as 20 mensagens
+    #  mais recentes intactas após o resumo; deixamos no padrão por simplicidade.)
+    memoria_middleware = SummarizationMiddleware(
+        model=modelo,
+        trigger=gatilho,
+    )
+
     # -- 6.2  Conexão "crua" com o banco, para NOSSAS tabelas de texto limpo ---
     # psycopg.connect abre uma conexão direta com o PostgreSQL usando a URL do .env.
     # Guardamos em `conn` e vamos usar nas funções garantir_conversa/salvar_mensagem.
@@ -177,20 +254,34 @@ def main():
         # -- 6.4  Montagem do agente -------------------------------------------
         # create_agent junta as 4 peças que preparamos:
         #   model         -> o cérebro (o LLM que raciocina e escreve).
-        #   tools         -> as ferramentas que ele PODE usar (busca na web).
+        #   tools         -> TODAS as ferramentas que ele PODE usar (web, CEP, temperatura).
         #   system_prompt -> a personalidade/instruções permanentes.
         #   checkpointer  -> onde a memória de cada conversa é salva.
+        #   middleware    -> lista de "meios de campo". A ORDEM importa: colocamos
+        #                    o tratamento de erro de tools primeiro e a sumarização
+        #                    depois. Os dois agem em momentos diferentes e convivem.
         agente = create_agent(
             model=modelo,
-            tools=tools,
+            tools=todas_as_tools,                              # <- várias tools (BLOCO 3)
             system_prompt=SYSTEM_PROMPT,
             checkpointer=checkpointer,
+            middleware=[tratar_erros_de_tool, memoria_middleware],  # erro de tool + memória
         )
 
         # -- 6.5  Identificador da conversa (thread_id) ------------------------
         # O thread_id separa conversas diferentes na memória. Mesmo thread_id =
         # o agente LEMBRA do que já foi dito. Trocar o thread_id = começar do zero.
-        thread_id = "conversa-1"
+        #
+        # Aqui PERGUNTAMOS qual conversa abrir, para você ter conversas DISTINTAS:
+        #   - input(...) mostra o texto e espera você digitar + Enter.
+        #   - .strip() remove espaços sobrando nas pontas.
+        #   - `or "conversa-1"` é um atalho: se você apertar Enter sem digitar
+        #     nada, o texto vira vazio ("") e o Python usa o valor da direita
+        #     ("conversa-1") como padrão. Se você digitou algo, ele usa o que
+        #     você digitou.
+        # Exemplos: digite "trabalho" hoje e amanhã -> ele CONTINUA essa conversa.
+        #           digite "pessoal" -> conversa SEPARADA, do zero, isolada.
+        thread_id = input("Nome da conversa (Enter para 'conversa-1'): ").strip() or "conversa-1"
 
         # config é um dicionário que passamos ao agente em toda chamada.
         # "configurable" -> "thread_id" diz ao checkpointer QUAL conversa é esta.
@@ -201,8 +292,11 @@ def main():
         conversa_id = garantir_conversa(conn, thread_id)
 
         # -- 6.6  Mensagens de boas-vindas no terminal -------------------------
-        print("Agente pronto! Digite sua mensagem.")
-        print("Para sair, digite: sair\n")
+        # f"..." é uma f-string: o que está dentro de {} é substituído pelo valor
+        # da variável. Aqui mostramos qual conversa (thread_id) foi aberta.
+        # (Repare: usamos f-string SÓ para exibir texto na tela. Para SQL, nunca.)
+        print(f"Agente pronto! Conversa aberta: '{thread_id}'.")
+        print("Digite sua mensagem. Para sair, digite: sair\n")
 
         # -- 6.7  O LOOP DE CONVERSA -------------------------------------------
         # `while True` repete para sempre, até darmos um `break` para parar.
@@ -263,18 +357,57 @@ if __name__ == "__main__":
 # uma mensagem e receba a resposta do agente por HTTP. Isso se chama "webhook":
 # um endereço (endpoint) que fica esperando requisições.
 #
-# A ideia (esqueleto, para você preencher depois — precisaria instalar FastAPI):
+# IDEIA-CHAVE: o thread_id, que hoje vem do input(), no webhook viria DE FORA,
+# dentro da requisição. Cada sistema/cliente manda o SEU thread_id (ex.: o
+# número de telefone), e você ganha memória isolada por conversa de graça.
 #
-#   from fastapi import FastAPI          # framework web leve para criar a API
-#   app = FastAPI()                      # cria a aplicação web
+# ATENÇÃO À PERFORMANCE: monte o agente UMA VEZ só, quando o servidor inicia
+# (fora do endpoint). Se montar dentro do @app.post, ele reconstruiria tudo a
+# cada requisição — lento e desnecessário. Por isso, no esboço abaixo, o
+# checkpointer e o create_agent ficam LÁ EM CIMA, e o endpoint só faz o invoke.
 #
-#   @app.post("/webhook")                # cria o endpoint que recebe POST em /webhook
-#   def receber(mensagem: str):          # 'mensagem' viria no corpo da requisição
-#       # Aqui dentro você montaria o agente (igual ao main() acima),
-#       # chamaria agente.invoke({"messages": [{"role": "user", "content": mensagem}]}, config)
-#       # e devolveria a resposta:
-#       resposta = "..."                 # resultado["messages"][-1].content
-#       return {"resposta": resposta}    # o FastAPI transforma isso em JSON de resposta
+# Esboço (comentado — precisaria instalar fastapi e uvicorn para rodar):
+#
+#   from fastapi import FastAPI               # framework web leve para criar a API
+#   from pydantic import BaseModel            # ajuda a descrever o formato da requisição
+#
+#   # --- MONTAGEM ÚNICA (roda 1x quando o servidor sobe) ---------------------
+#   load_dotenv()                             # carrega os segredos do .env
+#   _conn = psycopg.connect(DATABASE_URL)     # conexão para as tabelas de texto limpo
+#   _cm = PostgresSaver.from_conn_string(DATABASE_URL)  # abre o checkpointer...
+#   _checkpointer = _cm.__enter__()           # ...e o mantém aberto durante a vida do servidor
+#   _checkpointer.setup()                     # garante as tabelas internas do LangGraph
+#   _agente = create_agent(                   # monta o agente UMA vez
+#       model="openai:gpt-3.5-turbo",
+#       tools=tools,
+#       system_prompt=SYSTEM_PROMPT,
+#       checkpointer=_checkpointer,
+#   )
+#
+#   app = FastAPI()                           # cria a aplicação web
+#
+#   class Entrada(BaseModel):                 # descreve o corpo esperado da requisição:
+#       thread_id: str                        #   qual conversa (vem de fora!)
+#       mensagem: str                         #   o texto que o usuário mandou
+#
+#   @app.post("/webhook")                     # endpoint que recebe POST em /webhook
+#   def receber(dados: Entrada):              # 'dados' já vem validado (thread_id + mensagem)
+#       # CUIDADO: valide o thread_id, pois veio de fora (não confie cegamente).
+#       thread_id = dados.thread_id.strip()   # tira espaços das pontas
+#       if not thread_id:                     # se veio vazio, recuse a requisição
+#           return {"erro": "thread_id vazio"}
+#
+#       config = {"configurable": {"thread_id": thread_id}}  # <- o thread_id de fora entra aqui
+#       conversa_id = garantir_conversa(_conn, thread_id)    # garante a linha em 'conversas'
+#       salvar_mensagem(_conn, conversa_id, "user", dados.mensagem)  # salva a pergunta
+#
+#       resultado = _agente.invoke(           # chama o agente já montado
+#           {"messages": [{"role": "user", "content": dados.mensagem}]},
+#           config,
+#       )
+#       resposta = resultado["messages"][-1].content         # extrai o texto
+#       salvar_mensagem(_conn, conversa_id, "assistant", resposta)  # salva a resposta
+#       return {"resposta": resposta}         # o FastAPI transforma isso em JSON
 #
 # Para rodar (no futuro):  uv run uvicorn agent:app --reload
 # Deixamos apenas o PLANO comentado; nada disso executa agora.
