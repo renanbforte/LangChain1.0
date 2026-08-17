@@ -907,6 +907,82 @@ por todas as tools de API (princípio DRY: "não repita").
 
 ---
 
+## Consultar o banco em linguagem natural (SQL toolkit)
+
+O agente também sabe **consultar o próprio PostgreSQL** a partir de perguntas em
+português (ex.: "quantas conversas existem?"). Isso vem do **`SQLDatabaseToolkit`**
+do `langchain-community`, que adiciona **4 ferramentas** de SQL às suas tools:
+
+| Tool | O que faz |
+|---|---|
+| `sql_db_list_tables` | lista as tabelas do banco |
+| `sql_db_schema` | mostra as colunas/tipos de uma tabela |
+| `sql_db_query_checker` | pede ao modelo para **revisar** a query antes de rodar |
+| `sql_db_query` | **executa** a query no banco |
+
+O agente costuma usá-las **em sequência**: listar tabelas → ver o schema → revisar
+→ rodar. Por isso o `system_prompt` orienta essa ordem — dar esse "roteiro" ajuda
+o modelo a escolher a tool certa em cada etapa (sem isso, ele pode tentar rodar
+uma query sem saber os nomes das tabelas).
+
+### Onde fica no código
+
+Tudo é montado dentro da fábrica `construir_agente` em [`agent.py`](agent.py), em
+4 passos comentados: (1) `SQLDatabase.from_uri(...)`, (2) `SQLDatabaseToolkit(...)`,
+(3) `get_tools()`, (4) juntar com `ferramentas = [*todas_as_tools, *sql_tools]`.
+
+**Pegadinha de driver (importante):** o SQLAlchemy (usado por baixo) tenta o
+`psycopg2` quando a URL começa com `postgresql://` — e nós usamos o **psycopg v3**.
+Por isso o código troca o esquema para `postgresql+psycopg://` antes de conectar:
+
+```python
+sql_uri = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+```
+
+> **Nota:** o `langchain-community` está em **descontinuação** ("sunset"). Ao rodar,
+> você verá um `DeprecationWarning` — é esperado e não quebra nada. O toolkit ainda
+> funciona; só saiba que, no longo prazo, pode migrar para um pacote dedicado.
+
+### ⚠️ Segurança (leia com atenção)
+
+O `SQLDatabaseToolkit` é **poderoso e perigoso** por padrão:
+
+- A tool **`sql_db_query` executa QUALQUER SQL** que o modelo gerar — inclusive
+  comandos que **MODIFICAM ou DESTROEM** dados: `DELETE`, `UPDATE`, `DROP`,
+  `TRUNCATE`. Ela **não é** somente leitura.
+- A `sql_db_query_checker` **só revisa a sintaxe** da query (se vai rodar sem erro).
+  Ela **não** julga se a operação é segura — uma query `DROP TABLE` "bem escrita"
+  passa na revisão.
+- **O toolkit NÃO tem uma opção nativa confiável de "somente leitura".** Não existe
+  um parâmetro que bloqueie `DELETE`/`DROP` de forma garantida. (Confirmei isso na
+  versão instalada: os parâmetros do `SQLDatabase`, como `include_tables`, servem
+  para limitar QUAIS tabelas o agente enxerga — não para impedir escrita.)
+
+**O jeito certo de proteger (caminho para o futuro — não precisa fazer agora):**
+crie um usuário PostgreSQL **somente leitura** e use a connection string DELE para
+o toolkit. A segurança fica no **banco**, não no código — é à prova de "jailbreak"
+do modelo. O SQL seria:
+
+```sql
+-- 1. cria um usuário só de leitura
+CREATE USER agente_readonly WITH PASSWORD 'uma-senha-forte';
+-- 2. deixa ele CONECTAR e VER o schema
+GRANT CONNECT ON DATABASE agente_ia TO agente_readonly;
+GRANT USAGE ON SCHEMA public TO agente_readonly;
+-- 3. concede APENAS SELECT (leitura) nas tabelas atuais e futuras
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO agente_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO agente_readonly;
+```
+
+Depois, você teria no `.env` uma segunda URL, por exemplo
+`DATABASE_URL_RO=postgresql://agente_readonly:...@localhost:5432/agente_ia`, e
+passaria essa URL ao `SQLDatabase` (mantendo a `DATABASE_URL` normal para o
+checkpointer e as suas tabelas). Assim, mesmo que o modelo tente um `DELETE`, o
+banco **recusa** — o usuário não tem permissão. Enquanto não fizer isso, use o SQL
+toolkit só em um banco de estudo, ciente do risco.
+
+---
+
 ## Segurança (obrigatório)
 
 - **Todos os segredos vêm do `.env`** — chaves de API e a URL do banco. No

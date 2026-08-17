@@ -65,6 +65,15 @@ executar de ponta a ponta.
 - `wrap_tool_call` (de `langchain.agents.middleware`) é um **middleware**: decora
   uma função `(request, handler)` e vai em `create_agent(middleware=[...])`.
 - Tools/middlewares entram no agente por `create_agent(tools=..., middleware=[...])`.
+- `SQLDatabaseToolkit` e `SQLDatabase` vêm de `langchain_community.agent_toolkits`
+  e `langchain_community.utilities` (community está em "sunset", mas funciona).
+  `get_tools()` retorna 4 tools SQL. O toolkit exige um OBJETO de modelo
+  (`init_chat_model(modelo)`), não a string.
+- **Driver gotcha:** o SQLAlchemy usa `psycopg2` em `postgresql://`, que NÃO está
+  instalado (temos psycopg v3). Para o `SQLDatabase`, converter a URL para
+  `postgresql+psycopg://` antes de conectar.
+- **Segurança SQL:** `sql_db_query` roda QUALQUER SQL (inclui DELETE/DROP); o
+  toolkit não tem "read-only" nativo. Proteção real = usuário PostgreSQL só-leitura.
 - Se em dúvida sobre uma API, **inspecione a biblioteca instalada** (`inspect.signature`)
   em vez de assumir — a stack muda rápido.
 

@@ -31,6 +31,17 @@ from langchain.agents import create_agent
 # automaticamente, para não estourar a janela de contexto do modelo (ver README).
 from langchain.agents.middleware import SummarizationMiddleware
 
+# init_chat_model: cria um OBJETO de modelo a partir da string "provedor:modelo".
+# O SQLDatabaseToolkit (abaixo) precisa de um modelo de verdade, não da string.
+from langchain.chat_models import init_chat_model
+
+# SQLDatabase + SQLDatabaseToolkit: dão ao agente 4 ferramentas para consultar o
+# banco em linguagem natural (listar tabelas, ver schema, revisar e rodar query).
+# Vêm do langchain-community, que está em DESCONTINUAÇÃO ("sunset") mas ainda
+# funciona — ver a nota no README sobre isso.
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+
 # TavilySearch: a ferramenta (tool) que faz busca na web.
 from langchain_tavily import TavilySearch
 
@@ -115,10 +126,14 @@ todas_as_tools = [busca_web, *TOOLS]
 # como deve se comportar. Ele vale para a conversa inteira.
 SYSTEM_PROMPT = (
     "Você é um assistente prestativo e direto, que responde em português do Brasil. "
-    "Você tem ferramentas para: buscar na web, converter temperaturas e consultar "
-    "endereços por CEP. Escolha a ferramenta certa para cada pedido; se nenhuma se "
-    "aplicar, responda com seu próprio conhecimento. Quando a pergunta envolver fatos "
-    "atuais ou algo de que você não tem certeza, use a busca na web antes de responder."
+    "Você tem ferramentas para: buscar na web, converter temperaturas, consultar "
+    "endereços por CEP e consultar o banco de dados PostgreSQL do projeto. "
+    "Quando o usuário perguntar sobre os DADOS do banco (ex.: 'quantas conversas "
+    "existem', 'liste as últimas mensagens', 'quais tabelas há'), use as ferramentas "
+    "de SQL: primeiro liste as tabelas, depois veja o schema da tabela relevante e só "
+    "então escreva e rode a query. Escolha a ferramenta certa para cada pedido; se "
+    "nenhuma se aplicar, responda com seu próprio conhecimento. Quando a pergunta "
+    "envolver fatos atuais ou algo de que você não tem certeza, use a busca na web."
 )
 
 
@@ -158,11 +173,37 @@ def construir_agente(checkpointer=None):
     # O middleware de sumarização usa o MESMO modelo do agente para os resumos.
     memoria_middleware = SummarizationMiddleware(model=modelo, trigger=gatilho)
 
+    # -- Tools de SQL: consultar o banco em linguagem natural ------------------
+    # Passo 1: criar o objeto SQLDatabase conectado ao MESMO banco do .env.
+    #   PEGADINHA DE DRIVER: o SQLAlchemy (usado por baixo) tenta o 'psycopg2'
+    #   quando a URL começa com 'postgresql://'. Nós temos o psycopg v3, então
+    #   trocamos o esquema para 'postgresql+psycopg://'. O terceiro argumento (1)
+    #   do replace troca só a PRIMEIRA ocorrência (o começo da URL).
+    sql_uri = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+    #   from_uri conecta e "enxerga" as tabelas do banco (lista, colunas, etc.).
+    banco_sql = SQLDatabase.from_uri(sql_uri)
+
+    # Passo 2: criar o SQLDatabaseToolkit com o banco e o modelo.
+    #   O toolkit precisa de um OBJETO de modelo (não da string), porque uma das
+    #   tools usa o modelo para REVISAR a query antes de rodar. init_chat_model
+    #   cria esse objeto a partir da mesma string 'modelo' (Gemini continua ok).
+    modelo_obj = init_chat_model(modelo)
+    sql_toolkit = SQLDatabaseToolkit(db=banco_sql, llm=modelo_obj)
+
+    # Passo 3: obter a lista das 4 tools de SQL do toolkit.
+    #   sql_db_list_tables, sql_db_schema, sql_db_query_checker, sql_db_query.
+    sql_tools = sql_toolkit.get_tools()
+
+    # Passo 4: JUNTAR minhas tools (busca web, CEP, temperatura) com as de SQL.
+    #   O '*' desempacota cada lista dentro da nova. As tools de SQL são SOMADAS,
+    #   não substituem as minhas.
+    ferramentas = [*todas_as_tools, *sql_tools]
+
     # Junta tudo e devolve o grafo pronto.
     #   middleware: a ORDEM importa; erro de tool primeiro, sumarização depois.
     return create_agent(
         model=modelo,
-        tools=todas_as_tools,
+        tools=ferramentas,                                 # <- minhas tools + 4 tools de SQL
         system_prompt=SYSTEM_PROMPT,
         checkpointer=checkpointer,
         middleware=[tratar_erros_de_tool, memoria_middleware],
