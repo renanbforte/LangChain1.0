@@ -737,6 +737,176 @@ tabelas. Faça exatamente assim:
 
 ---
 
+## PARTE 4 — Ver o agente "por dentro" (LangSmith e LangGraph Studio)
+
+Até aqui você lê as conversas no banco (texto). Mas como **entender o raciocínio**
+do agente — qual tool ele decidiu chamar, o que ela respondeu, quantos tokens
+gastou? Para isso existem duas ferramentas visuais. Elas são **opcionais**, mas
+excelentes para quem está aprendendo.
+
+### 4.1 LangSmith — o "raio-x" da conversa (painel na web)
+
+O **LangSmith** grava cada passo do agente e mostra num painel online: o prompt
+enviado ao modelo, cada chamada de tool com entrada/saída, tokens, tempo e custo.
+É como ver o "filme" do que aconteceu por dentro de cada resposta.
+
+**O melhor:** você **não muda uma linha de código**. O LangChain manda os dados
+sozinho quando encontra as variáveis certas no `.env`. Basta preencher:
+
+```bash
+LANGSMITH_TRACING=true                          # liga o rastreamento
+LANGSMITH_API_KEY=coloque-sua-chave-langsmith   # sua chave (só no .env)
+LANGSMITH_PROJECT=langchain1-estudo             # nome do projeto no painel
+```
+
+Passo a passo:
+1. Crie conta em https://smith.langchain.com/ e gere uma **API key** (em Settings).
+2. Cole as três variáveis acima no seu `.env` (elas já estão no `.env.example`).
+3. Rode o agente normalmente: `uv run python agent.py` e converse.
+4. Volte ao site do LangSmith → seu projeto `langchain1-estudo`. Cada mensagem
+   vira um **trace**: clique para abrir e navegar passo a passo (prompt → decisão
+   de tool → resultado → resposta). É aqui que você "vê" o agente pensando.
+
+> Por que não precisa de código? Porque o LangChain checa essas variáveis de
+> ambiente automaticamente. Sem `LANGSMITH_TRACING=true`, nada é enviado — então
+> é seguro deixar desligado quando não quiser rastrear.
+
+### 4.2 LangGraph Studio — o grafo visual (e o `langgraph.json`)
+
+O **LangGraph Studio** é um painel LOCAL onde você **vê o grafo do agente
+desenhado** (os nós, as ligações) e pode **executá-lo pela interface**, sem o
+terminal. Para ele funcionar, o LangGraph precisa de um arquivo de configuração
+na raiz do projeto: o **`langgraph.json`**.
+
+O nosso [`langgraph.json`](langgraph.json):
+
+```json
+{
+    "dependencies": ["."],
+    "graphs": {
+        "agente": "./agent.py:criar_grafo"
+    },
+    "env": ".env"
+}
+```
+
+Campo a campo:
+- **`dependencies`**: onde estão as dependências do projeto. `["."]` = "a pasta
+  atual" (o LangGraph usa o `pyproject.toml`/`uv` daqui).
+- **`graphs`**: o mapa de grafos que o Studio vai mostrar. A chave `"agente"` é
+  o nome que aparece no painel; o valor `"./agent.py:criar_grafo"` diz
+  **arquivo:função** — "no `agent.py`, chame a função `criar_grafo`".
+- **`env`**: qual arquivo de segredos carregar. Apontamos para o `.env`.
+
+**Por que `criar_grafo` e não o agente do `main()`?** Porque o Studio precisa
+importar o grafo "de fora", e o agente do `main()` é montado dentro de uma
+função (o Studio não alcança). Por isso criamos, no `agent.py`, uma **fábrica**
+de grafo no nível do módulo:
+
+```python
+def construir_agente(checkpointer=None):   # monta o agente (reusado pelo terminal e Studio)
+    ...
+    return create_agent(...)
+
+def criar_grafo():                         # é ESTA função que o langgraph.json chama
+    return construir_agente(checkpointer=None)   # sem checkpointer: o Studio cuida do estado
+```
+
+Repare que o **mesmo** `construir_agente` é usado pelo terminal (`main()`) e pelo
+Studio — não duplicamos a montagem. É a mesma separação de responsabilidades das
+tools, aplicada ao agente.
+
+**Como rodar o Studio (precisa do `.env` preenchido):**
+
+```powershell
+uv run langgraph dev
+```
+
+- Isso sobe um servidor local e abre o Studio no navegador. Você vê o grafo
+  `agente` e pode mandar mensagens pela interface.
+- Para **conferir** se o `langgraph.json` está correto sem subir o servidor:
+
+```powershell
+uv run langgraph validate
+```
+
+Deve responder `Configuration file ... is valid. (1 graph found)`.
+
+> LangSmith x Studio: são complementares. O **Studio** é local e mostra o grafo
+> e a execução; o **LangSmith** é na nuvem e guarda o histórico de traces. Com a
+> chave do LangSmith configurada, o que você roda no Studio também aparece lá.
+
+---
+
+## Arquitetura de tools — a pasta `tools/`
+
+Quando o projeto tem **muitas tools**, jogar todas no `agent.py` vira bagunça.
+Por isso as tools moram num **pacote** separado, a pasta [`tools/`](tools):
+
+```
+tools/
+├── __init__.py          # registro central: exporta TOOLS e o middleware de erro
+├── _shared.py           # infra compartilhada: HTTP com timeout/erro + ToolExternaError
+├── error_handling.py    # tratamento de erro central (wrap_tool_call middleware)
+├── temperatura.py       # domínio: schema + service + @tool (cálculo puro)
+└── cep.py               # domínio: schema + service + @tool (API ViaCEP)
+```
+
+### Anatomia de uma tool (3 camadas)
+
+Cada tool é dividida em três partes, cada uma com **uma** responsabilidade:
+
+1. **Schema** (Pydantic `BaseModel`): descreve e **valida** a entrada. O
+   `description` de cada campo é lido pelo agente para saber o que preencher.
+2. **Service**: a lógica pura (cálculo ou chamada de API), **sem LangChain** —
+   testável sozinha e reutilizável.
+3. **Tool** (`@tool`): a "casquinha" fina que liga schema + service e devolve
+   **texto** para o agente.
+
+> **Ligação do schema (pegadinha comum):** definir a classe Pydantic **não**
+> conecta nada sozinho. Você liga passando `args_schema=` no decorator:
+> `@tool("buscar_cep", args_schema=CEPInput)`. Sem isso, o schema fica decorativo.
+
+### Registro central
+
+O agente importa **só a vitrine** — uma linha:
+
+```python
+from tools import TOOLS, tratar_erros_de_tool
+```
+
+O [`tools/__init__.py`](tools/__init__.py) reúne todas as tools numa lista
+`TOOLS`. O agente não sabe em qual arquivo cada tool mora (**baixo acoplamento**):
+se você reorganizar os arquivos internos, o `agent.py` nem percebe.
+
+### Como adicionar uma tool nova (o passo a passo)
+
+1. Crie `tools/nova.py` com as 3 camadas (schema → service → `@tool`).
+2. Importe e registre em `tools/__init__.py`:
+   ```python
+   from .nova import minha_tool
+   TOOLS = [converter_temperatura, buscar_cep, minha_tool]  # <- adicione aqui
+   ```
+3. Pronto. O `agent.py` usa `*TOOLS`, então a tool entra **sozinha** no agente.
+   Você **não mexe** no `agent.py`.
+
+### Tratamento de erro central
+
+Em vez de repetir `try/except` em cada tool, há **um** middleware
+([`tools/error_handling.py`](tools/error_handling.py)) que envolve a execução de
+**qualquer** tool. Se uma tool levanta `ToolExternaError`, ele devolve uma
+mensagem amigável ao agente em vez de derrubar o programa. É a mesma lógica de
+timeout/HTTP/JSON compartilhada em `tools/_shared.py` — escrita **uma vez**, usada
+por todas as tools de API (princípio DRY: "não repita").
+
+### Quando isso vale a pena
+
+- **1–2 tools simples:** um arquivo só resolve; essa estrutura é exagero.
+- **A partir de ~3 tools, ou qualquer tool que chame API:** começa a compensar.
+- **Muitas tools / vários domínios:** praticamente obrigatório.
+
+---
+
 ## Segurança (obrigatório)
 
 - **Todos os segredos vêm do `.env`** — chaves de API e a URL do banco. No

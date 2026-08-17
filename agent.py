@@ -123,6 +123,65 @@ SYSTEM_PROMPT = (
 
 
 # -----------------------------------------------------------------------------
+# BLOCO 4b — A FÁBRICA DO AGENTE (monta o "grafo"; reusada pelo terminal e Studio)
+# -----------------------------------------------------------------------------
+# Por que uma função separada? Porque duas coisas diferentes precisam montar o
+# MESMO agente, e não queremos copiar o código em dois lugares:
+#   1) o loop de terminal (main), que passa o PostgresSaver como checkpointer;
+#   2) o LangGraph Studio (via langgraph.json), que precisa de um grafo montável
+#      "de fora". O Studio gerencia a persistência dele, então chamamos sem
+#      checkpointer nesse caso.
+# Extrair para uma fábrica é a mesma ideia de separação de responsabilidades das
+# tools: montar o agente vira uma peça reutilizável e testável.
+def construir_agente(checkpointer=None):
+    """Monta e devolve o agente (o 'grafo' do LangGraph) com tools + middlewares.
+
+    checkpointer: onde salvar a memória. No terminal passamos o PostgresSaver;
+                  no Studio deixamos None (a plataforma cuida da persistência).
+    """
+    # Modelo de linguagem (string "provedor:modelo"). Trocar aqui troca em tudo.
+    modelo = "openai:gpt-3.5-turbo"
+    # Para o Gemini no futuro:  modelo = "google_genai:gemini-1.5-flash"
+
+    # Monta a regra de sumarização a partir da estratégia lida do .env (BLOCO 2).
+    #   ("tokens", N)   -> resume quando o histórico passa de N tokens.
+    #   ("messages", N) -> resume quando o histórico passa de N mensagens.
+    if ESTRATEGIA_MEMORIA == "tokens":
+        gatilho = ("tokens", MAX_TOKENS_RESUMO)
+    elif ESTRATEGIA_MEMORIA == "mensagens":
+        gatilho = ("messages", MAX_MENSAGENS_RESUMO)
+    else:
+        # Valor inesperado no .env -> avisa e cai no padrão seguro (tokens).
+        print(f"[aviso] ESTRATEGIA_MEMORIA='{ESTRATEGIA_MEMORIA}' invalida; usando 'tokens'.")
+        gatilho = ("tokens", MAX_TOKENS_RESUMO)
+
+    # O middleware de sumarização usa o MESMO modelo do agente para os resumos.
+    memoria_middleware = SummarizationMiddleware(model=modelo, trigger=gatilho)
+
+    # Junta tudo e devolve o grafo pronto.
+    #   middleware: a ORDEM importa; erro de tool primeiro, sumarização depois.
+    return create_agent(
+        model=modelo,
+        tools=todas_as_tools,
+        system_prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer,
+        middleware=[tratar_erros_de_tool, memoria_middleware],
+    )
+
+
+# -----------------------------------------------------------------------------
+# BLOCO 4c — GRAFO PARA O LANGGRAPH STUDIO (o alvo do langgraph.json)
+# -----------------------------------------------------------------------------
+# O arquivo langgraph.json aponta para esta função (agent.py:criar_grafo).
+# Quando você roda `langgraph dev`, o Studio IMPORTA e CHAMA criar_grafo() para
+# desenhar e executar o agente no painel visual. Passamos checkpointer=None
+# porque, no Studio, a própria plataforma cuida de guardar o estado.
+def criar_grafo():
+    """Fábrica de grafo para o LangGraph Studio (usada pelo langgraph.json)."""
+    return construir_agente(checkpointer=None)
+
+
+# -----------------------------------------------------------------------------
 # BLOCO 5 — FUNÇÕES QUE SALVAM O HISTÓRICO EM TEXTO LIMPO (NAS NOSSAS TABELAS)
 # -----------------------------------------------------------------------------
 # O LangGraph guarda a memória dele nas tabelas "checkpoints" em formato jsonb
@@ -192,56 +251,12 @@ def salvar_mensagem(conn, conversa_id, papel, conteudo):
 # BLOCO 6 — O PROGRAMA PRINCIPAL (monta o agente e roda o loop de conversa)
 # -----------------------------------------------------------------------------
 def main():
-    # -- 6.1  Escolha do modelo de linguagem -----------------------------------
-    # No LangChain 1.0 podemos indicar o modelo por uma STRING no formato
-    # "provedor:modelo". O create_agent cria o objeto do modelo por baixo.
-    #   OpenAI (atual):
-    modelo = "openai:gpt-3.5-turbo"
-    #   PARA TROCAR PARA O GEMINI DEPOIS: comente a linha acima e descomente
-    #   a de baixo (a chave GOOGLE_API_KEY precisa estar no .env).
-    # modelo = "google_genai:gemini-1.5-flash"
-
-    # -- 6.1b  Controle de memória: sumarização de conversas longas ------------
-    # Toda vez que você conversa, TODO o histórico é reenviado ao modelo. Como o
-    # modelo tem um limite de texto por vez (a "janela de contexto"), uma conversa
-    # muito longa acabaria estourando esse limite (erro) ou ficando cara/lenta.
-    # O SummarizationMiddleware resolve isso: quando o histórico cresce demais,
-    # ele RESUME as mensagens antigas em um texto curto e continua a conversa.
-    #
-    # Escolhemos a estratégia pela variável ESTRATEGIA_MEMORIA (lida do .env),
-    # SEM comentar/descomentar código. O if/elif monta a tupla "gatilho" certa:
-    #   ("tokens", N)   -> resume quando o histórico passa de N tokens.
-    #   ("messages", N) -> resume quando o histórico passa de N mensagens.
-    if ESTRATEGIA_MEMORIA == "tokens":
-        # Estratégia principal (padrão): contar TOKENS (pedaços de texto).
-        gatilho = ("tokens", MAX_TOKENS_RESUMO)
-    elif ESTRATEGIA_MEMORIA == "mensagens":
-        # Estratégia alternativa: contar o NÚMERO de mensagens trocadas.
-        gatilho = ("messages", MAX_MENSAGENS_RESUMO)
-    else:
-        # Se a variável vier com um valor inesperado (ex.: erro de digitação),
-        # avisamos e caímos no padrão seguro (tokens), para o programa não quebrar.
-        print(f"[aviso] ESTRATEGIA_MEMORIA='{ESTRATEGIA_MEMORIA}' invalida; usando 'tokens'.")
-        gatilho = ("tokens", MAX_TOKENS_RESUMO)
-
-    # Cria o middleware de sumarização.
-    #   model=modelo  -> usa o MESMO modelo do agente para gerar os resumos
-    #                    (se você trocar para o Gemini lá em cima, o resumo também
-    #                    passa a usar o Gemini, automaticamente).
-    #   trigger=gatilho -> a regra de QUANDO resumir, montada no if/elif acima.
-    # (Existe ainda o parâmetro 'keep', que por padrão mantém as 20 mensagens
-    #  mais recentes intactas após o resumo; deixamos no padrão por simplicidade.)
-    memoria_middleware = SummarizationMiddleware(
-        model=modelo,
-        trigger=gatilho,
-    )
-
-    # -- 6.2  Conexão "crua" com o banco, para NOSSAS tabelas de texto limpo ---
+    # -- 6.1  Conexão "crua" com o banco, para NOSSAS tabelas de texto limpo ---
     # psycopg.connect abre uma conexão direta com o PostgreSQL usando a URL do .env.
     # Guardamos em `conn` e vamos usar nas funções garantir_conversa/salvar_mensagem.
     conn = psycopg.connect(DATABASE_URL)
 
-    # -- 6.3  O checkpointer (memória do agente no PostgreSQL) ------------------
+    # -- 6.2  O checkpointer (memória do agente no PostgreSQL) ------------------
     # PostgresSaver.from_conn_string(...) devolve um "context manager": por isso
     # usamos `with`. O `with` garante que a conexão do checkpointer seja ABERTA
     # no começo do bloco e FECHADA corretamente no fim (mesmo se ocorrer erro).
@@ -251,22 +266,10 @@ def main():
         # nas próximas, apenas confere que já está tudo lá.
         checkpointer.setup()
 
-        # -- 6.4  Montagem do agente -------------------------------------------
-        # create_agent junta as 4 peças que preparamos:
-        #   model         -> o cérebro (o LLM que raciocina e escreve).
-        #   tools         -> TODAS as ferramentas que ele PODE usar (web, CEP, temperatura).
-        #   system_prompt -> a personalidade/instruções permanentes.
-        #   checkpointer  -> onde a memória de cada conversa é salva.
-        #   middleware    -> lista de "meios de campo". A ORDEM importa: colocamos
-        #                    o tratamento de erro de tools primeiro e a sumarização
-        #                    depois. Os dois agem em momentos diferentes e convivem.
-        agente = create_agent(
-            model=modelo,
-            tools=todas_as_tools,                              # <- várias tools (BLOCO 3)
-            system_prompt=SYSTEM_PROMPT,
-            checkpointer=checkpointer,
-            middleware=[tratar_erros_de_tool, memoria_middleware],  # erro de tool + memória
-        )
+        # -- 6.3  Monta o agente usando a fábrica construir_agente (BLOCO 4b) ---
+        # Passamos o checkpointer do Postgres para o agente ter MEMÓRIA persistente.
+        # O mesmo builder é reusado pelo LangGraph Studio (lá sem checkpointer).
+        agente = construir_agente(checkpointer)
 
         # -- 6.5  Identificador da conversa (thread_id) ------------------------
         # O thread_id separa conversas diferentes na memória. Mesmo thread_id =

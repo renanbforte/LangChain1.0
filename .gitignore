@@ -17,3 +17,6 @@ __pycache__/
 
 # Cache do gerenciador uv (opcional, mas recomendado ignorar).
 .uv/
+
+# Estado local do LangGraph Studio (`langgraph dev`). É temporário, não versione.
+.langgraph_api/
