@@ -1074,6 +1074,157 @@ toolkit só em um banco de estudo, ciente do risco.
 
 ---
 
+## Multi-usuário: identidade, isolamento e produção
+
+Esta seção é para quem vai colocar o agente **em uso de verdade**, servindo várias
+pessoas. Um agente multi-usuário precisa de **três** coisas: (1) saber **quem** está
+falando, (2) **isolar** os dados de cada um, e (3) aguentar acessos **simultâneos**.
+
+### 1. Identidade tem que ser VALIDADA (não digitada)
+
+Nada que o usuário digita serve como identidade — nem nome, nem telefone: qualquer
+um pode digitar o dado de outra pessoa. A identidade precisa vir de um **canal que
+a validou**. É por isso que se usa o **webhook**: o identificador (ex.: número de
+telefone) **chega na requisição, vindo da plataforma** (WhatsApp/Telegram), que já
+validou aquele número. Veja a seção [Preparado para o futuro](#preparado-para-o-futuro)
+para o endpoint FastAPI. O `thread_id` passa a **ser** o identificador validado.
+
+> ⚠️ O webhook em si também precisa ser conferido: a plataforma **assina** a
+> requisição com um segredo, e seu código verifica essa assinatura **antes** de
+> confiar no remetente. Sem isso, um impostor forja a requisição. (Depende de
+> infraestrutura externa — conta na Meta/Twilio, URL pública.)
+
+### 2. Tabela de usuários e o "master"
+
+Guarde quem existe e quem pode ver tudo:
+
+```sql
+CREATE TABLE IF NOT EXISTS usuarios (
+    id SERIAL PRIMARY KEY,
+    login TEXT UNIQUE NOT NULL,        -- o identificador validado (ex.: o número)
+    nome TEXT,
+    is_master BOOLEAN NOT NULL DEFAULT FALSE,  -- TRUE = vê tudo; FALSE = só o dele
+    criado_em TIMESTAMP DEFAULT NOW()
+);
+UPDATE usuarios SET is_master = TRUE WHERE login = '5511999998888';  -- promova um master
+```
+
+No código, uma função `identificar_usuario(conn, login)` cria o usuário (como
+não-master) se não existir e devolve `(id, login, is_master)`.
+
+### 3. Isolamento de dados com Row-Level Security (RLS)
+
+Com o SQL toolkit, o modelo escreve SQL **livre** — então filtrar "no código" não
+segura (o modelo pode pedir qualquer coisa). A trava confiável é a **RLS do
+PostgreSQL**: cada linha ganha um **dono** (`owner`), e uma **política** só deixa o
+usuário ver as linhas dele. Mesmo um `SELECT * FROM mensagens` só devolve as linhas
+do usuário atual — a filtragem acontece dentro do banco.
+
+```sql
+-- coluna de dono + preenche as existentes
+ALTER TABLE conversas ADD COLUMN IF NOT EXISTS owner TEXT;
+UPDATE conversas SET owner = thread_id WHERE owner IS NULL;
+ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS owner TEXT;
+UPDATE mensagens m SET owner = c.thread_id
+    FROM conversas c WHERE m.conversa_id = c.id AND m.owner IS NULL;
+
+-- liga o RLS e cria a política (só LÊ as linhas do usuário da sessão)
+ALTER TABLE conversas ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS conversa_do_dono ON conversas;
+CREATE POLICY conversa_do_dono ON conversas
+    FOR SELECT USING (owner = current_setting('app.usuario', true));
+ALTER TABLE mensagens ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS mensagem_do_dono ON mensagens;
+CREATE POLICY mensagem_do_dono ON mensagens
+    FOR SELECT USING (owner = current_setting('app.usuario', true));
+
+GRANT SELECT ON conversas, mensagens TO agente_leitura;
+```
+
+- `current_setting('app.usuario', true)` lê uma **variável de sessão** que o app
+  define na conexão. O `true` devolve NULL se ela não estiver setada — aí a política
+  não casa com ninguém e o usuário vê **nada** (comportamento seguro: *fail-closed*).
+- **O master é de graça:** superusuários do PostgreSQL **ignoram** o RLS. Então a
+  conexão `postgres` (sua `DATABASE_URL`) vê tudo = master; a conexão `agente_leitura`
+  respeita o RLS = usuário comum.
+
+### 4. Ligar o RLS ao agente (a conexão certa por usuário)
+
+O truque é **carimbar** o `app.usuario` na conexão do SQL toolkit, por usuário. Em
+`tools/sql.py`:
+
+```python
+def criar_tools_sql(database_url, modelo, app_usuario=None):
+    uri = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    engine_args = {}
+    if app_usuario is not None:
+        # SEGURANÇA: só alfanuméricos, para o valor não injetar options extras.
+        seguro = "".join(c for c in app_usuario if c.isalnum())
+        engine_args = {"connect_args": {"options": f"-c app.usuario={seguro}"}}
+    banco = SQLDatabase.from_uri(uri, engine_args=engine_args)
+    return SQLDatabaseToolkit(db=banco, llm=modelo).get_tools()
+```
+
+No webhook, monte o agente **por requisição** escolhendo a conexão conforme quem é:
+
+```python
+if is_master:
+    sql_tools = criar_tools_sql(DATABASE_URL, modelo_obj)                      # postgres: vê tudo
+else:
+    sql_tools = criar_tools_sql(DATABASE_URL_RO, modelo_obj, app_usuario=identidade)  # RLS: só o dele
+agente = create_agent(model="openai:gpt-3.5-turbo", tools=[*TOOLS, *sql_tools],
+                      system_prompt=system_prompt, checkpointer=checkpointer,
+                      middleware=[tratar_erros_de_tool])
+```
+
+**Teste:** com um master e um usuário comum, faça a MESMA pergunta ("liste todas as
+conversas"). O master vê as de todos; o comum vê só as dele — mesmo pedindo "todas".
+
+### 5. Produção: concorrência e pool de conexões (IMPORTANTE)
+
+O código acima usa **uma** conexão (`conn = psycopg.connect(...)`) e um checkpointer
+com conexão única. Isso é **correto para testes um-de-cada-vez**, mas o FastAPI atende
+**várias requisições ao mesmo tempo** (em threads). Uma conexão do psycopg **não é
+segura para uso simultâneo** — duas requisições na mesma conexão = erro, resposta
+trocada ou crash. Para uso real, troque a conexão única por um **pool** (várias
+conexões; cada requisição pega uma livre e devolve depois):
+
+```python
+from psycopg_pool import ConnectionPool
+
+pool = ConnectionPool(DATABASE_URL, open=True)   # em vez de psycopg.connect(...)
+
+# o checkpointer ACEITA um pool (Conn = Union[Connection, ConnectionPool]):
+checkpointer = PostgresSaver(pool)
+checkpointer.setup()
+
+@app.post("/webhook")
+def receber(msg: Mensagem):
+    with pool.connection() as conn:      # cada requisição pega a SUA conexão
+        _id, login, is_master = identificar_usuario(conn, identidade)
+        conversa_id = garantir_conversa(conn, thread_id, owner=identidade)
+        salvar_mensagem(conn, conversa_id, "user", msg.texto, owner=identidade)
+        # ... invoke ...
+        salvar_mensagem(conn, conversa_id, "assistant", resposta, owner=identidade)
+    # ao sair do "with", a conexão volta para o pool
+```
+
+Regra: **teste sequencial → conexão única basta; produção com acessos simultâneos →
+pool.** (Otimização extra: cachear as tools de SQL por usuário para não reinspecionar
+o schema a cada requisição.)
+
+### 6. Checklist para "colocar em uso"
+
+- [ ] Identidade vem do **webhook** (validada), não digitada.
+- [ ] **Assinatura** do webhook verificada antes de confiar no remetente.
+- [ ] Usuário **só-leitura** (`agente_leitura`) para o SQL toolkit dos comuns.
+- [ ] **RLS** ligada em `conversas`/`mensagens` com `owner`.
+- [ ] Master via conexão `postgres`; comum via `agente_leitura` + `app.usuario`.
+- [ ] **Pool de conexões** (não conexão única) para aguentar acessos simultâneos.
+- [ ] Segredos no `.env`, `.env` no `.gitignore`.
+
+---
+
 ## Segurança (obrigatório)
 
 - **Todos os segredos vêm do `.env`** — chaves de API e a URL do banco. No
