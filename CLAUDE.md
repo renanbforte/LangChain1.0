@@ -46,6 +46,26 @@ executar de ponta a ponta.
   em paralelo, as tabelas `conversas`/`mensagens` guardam o histórico legível.
 - **`langgraph.json`** — config do LangGraph Studio; aponta para `agent.py:criar_grafo`.
 
+## Multi-usuário e produção (webhook)
+
+- **Identidade:** vem VALIDADA do canal (webhook), nunca digitada. No `webhook.py`,
+  o campo `de` da requisição É a identidade; `thread_id = de` e `owner = de`.
+  Produção exige verificar a ASSINATURA do webhook antes de confiar no `de`.
+- **Tabela `usuarios`** (`login`, `is_master`): fonte da verdade de quem existe e
+  quem vê tudo. `identificar_usuario(conn, login)` cria (não-master) e devolve
+  `(id, login, is_master)`.
+- **Isolamento por RLS:** `conversas`/`mensagens` têm coluna `owner` + RLS. Política
+  `USING (owner = current_setting('app.usuario', true))`. Superusuário `postgres`
+  IGNORA a RLS (= master); `agente_leitura` respeita (= usuário comum).
+- **Wiring do agente (por usuário):** master → SQL toolkit na conexão `postgres`
+  (vê tudo); comum → `agente_leitura` com `app.usuario` carimbado via
+  `SQLDatabase.from_uri(uri, engine_args={"connect_args": {"options": f"-c app.usuario={seguro}"}})`.
+  SANITIZAR o valor (só alfanuméricos) — anti-injeção de options. Agente montado
+  POR requisição, pois a conexão SQL muda por usuário.
+- **Concorrência (produção):** conexão única (`psycopg.connect`) só serve teste
+  sequencial. Para acessos simultâneos: `psycopg_pool.ConnectionPool` +
+  `PostgresSaver(pool)` (o checkpointer aceita pool — `Conn = Union[Connection, ConnectionPool]`).
+
 ## Convenções (seguir)
 
 - **Segredos SÓ do `.env`** (`load_dotenv()` + `os.environ`/`os.getenv`). NUNCA
@@ -54,6 +74,9 @@ executar de ponta a ponta.
 - **Nova tool:** criar arquivo em `tools/`, registrar em `tools/__init__.py`.
   NÃO editar `agent.py` para isso (ele usa `*TOOLS`).
 - **Ligar schema à tool:** `@tool("nome", args_schema=MeuSchema)`.
+- **Nunca fixe o `thread_id`:** derive-o da identidade (número no webhook, login no
+  terminal); `owner` = a mesma identidade. Fixo = todos na mesma conversa + `owner`
+  vazio (quebra o isolamento por RLS).
 - **Comentar bastante**, em português, no nível de quem está aprendendo.
 
 ## APIs verificadas nesta versão (LangChain 1.x) — não assumir versões antigas
