@@ -1094,6 +1094,29 @@ para o endpoint FastAPI. O `thread_id` passa a **ser** o identificador validado.
 > confiar no remetente. Sem isso, um impostor forja a requisição. (Depende de
 > infraestrutura externa — conta na Meta/Twilio, URL pública.)
 
+> 🔑 **Regra de ouro: nunca deixe o `thread_id` fixo no código.** Um valor fixo
+> (ex.: `thread_id = "conversa-1"`) causa **dois** problemas:
+> 1. **Todos caem na mesma conversa** — sem separação nem memória por pessoa.
+> 2. Se o `thread_id` **não** vem da identidade, o **`owner`** das linhas fica sem
+>    preencher, e o isolamento por RLS "quebra": linhas sem dono não aparecem para
+>    ninguém (só para o master).
+>
+> O certo, em **qualquer** porta de entrada (terminal ou webhook):
+> - **`thread_id` = a identidade** (o número validado, no webhook; o login, no terminal);
+> - **`owner` = a mesma identidade**, gravado em cada conversa e mensagem.
+>
+> No terminal, a identidade é **digitada** (serve só para desenvolvimento, não é
+> segurança); no webhook, ela vem **validada** pelo canal. Mas os dois seguem a
+> MESMA regra — assim o terminal e o webhook usam o mesmo modelo de dados, e o
+> isolamento vale nos dois. No terminal:
+>
+> ```python
+> login = input("Quem é você (login)? ").strip().lower() or "renan"
+> thread_id = login                                       # cada login = a conversa dele
+> config = {"configurable": {"thread_id": thread_id}}
+> conversa_id = garantir_conversa(conn, thread_id, owner=login)   # grava o dono
+> ```
+
 ### 2. Tabela de usuários e o "master"
 
 Guarde quem existe e quem pode ver tudo:
