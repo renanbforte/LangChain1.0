@@ -226,21 +226,21 @@ uv sync
 - `uv sync` lê o `pyproject.toml`, cria a pasta `.venv` (o ambiente isolado) e
   baixa **todas** as bibliotecas listadas. Pode demorar um pouco na 1ª vez.
 
-> ⚠️ **Está no OneDrive? Use `uv sync --link-mode=copy`.** Se a pasta do projeto
-> estiver dentro do OneDrive (ou de outra pasta sincronizada na nuvem), o
-> `uv sync` normal FALHA com um erro tipo *"A operação de nuvem não pode ser
-> executada... links físicos incompatíveis (os error 396)"*. Motivo: o `uv`
-> usa *hardlinks* por padrão, e o OneDrive não suporta. A correção é mandar o
-> `uv` copiar em vez de "linkar":
+> ⚠️ **Deu erro "os error 396"? Use `uv sync --link-mode=copy`.** Se a pasta do
+> projeto for gerenciada por uma **sincronização em nuvem** (OneDrive, Google
+> Drive, Dropbox…), o `uv sync` normal pode FALHAR com *"A operação de nuvem não
+> pode ser executada... links físicos incompatíveis (os error 396)"*. Motivo: o
+> `uv` usa *hardlinks* por padrão, e esses sincronizadores não suportam. A
+> correção é mandar o `uv` **copiar** em vez de "linkar":
 >
 > ```powershell
 > uv sync --link-mode=copy
 > ```
 >
 > Para não digitar isso toda vez, configure de uma vez (e reabra o terminal):
-> `setx UV_LINK_MODE copy`. **Melhor ainda:** mantenha projetos Python **fora**
-> do OneDrive (ex.: `C:\Users\voce\Projetos\...`) — evita esse erro e a
-> sincronização constante da `.venv`. Veja mais em
+> `setx UV_LINK_MODE copy`. **Melhor ainda:** mantenha projetos Python **fora** de
+> qualquer pasta sincronizada (ex.: `C:\Projetos\...`, na raiz do disco) — evita
+> esse erro e a sincronização constante da `.venv`. Veja mais em
 > [Problemas comuns no Windows](#problemas-comuns-no-windows).
 
 ### 2.0.4 Criar o seu `.env` a partir do modelo
@@ -1126,14 +1126,17 @@ O que cada um faz:
 
 Erros reais que aparecem no dia a dia (Windows + PowerShell + uv) e como resolver.
 
-### 1. `uv sync` falha com "operação de nuvem / os error 396" (OneDrive)
+### 1. `uv sync` falha com "operação de nuvem / os error 396"
 
 **Sintoma:** ao rodar `uv sync`, aparece algo como *"Failed to hardlink... A
 operação de nuvem não pode ser executada em um arquivo com links físicos
 incompatíveis. (os error 396)"* e a `.venv` fica incompleta.
 
-**Causa:** a pasta do projeto está dentro do **OneDrive**. O `uv` usa *hardlinks*
-por padrão; o OneDrive não suporta.
+**Causa:** a pasta do projeto é gerenciada por uma **sincronização em nuvem** —
+OneDrive, **Google Drive** ou **Dropbox** para desktop. O `uv` usa *hardlinks* por
+padrão; esses sincronizadores não suportam. (Como confirmar: o erro `396` é da
+categoria "arquivos em nuvem" do Windows — se aparece, algum sincronizador está
+tocando a pasta, mesmo que o caminho pareça local.)
 
 **Correção:** apague a `.venv` quebrada e refaça em modo cópia:
 
@@ -1143,7 +1146,8 @@ uv sync --link-mode=copy
 ```
 
 Para valer sempre: `setx UV_LINK_MODE copy` (e reabra o terminal). **Melhor:**
-mantenha o projeto **fora** do OneDrive (ex.: `C:\Users\voce\Projetos\...`).
+mantenha o projeto **fora** de qualquer pasta sincronizada — o mais seguro é a
+raiz do disco, tipo `C:\Projetos\...` (fora de `C:\Users\...`).
 
 ### 2. `ModuleNotFoundError` (ex.: "No module named 'jsonpatch'") ao importar
 
