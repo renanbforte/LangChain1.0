@@ -1106,12 +1106,66 @@ modelo = "openai:gpt-3.5-turbo"           # atual
 # modelo = "google_genai:gemini-1.5-flash"  # futuro (precisa da GOOGLE_API_KEY no .env)
 ```
 
-**Receber mensagens via webhook** — hoje conversamos pelo terminal. No futuro,
-um sistema externo (site, WhatsApp) pode mandar uma mensagem por HTTP e receber
-a resposta. Isso se chama **webhook**: um endereço (endpoint) que espera
-requisições. O **esqueleto comentado** (com FastAPI) já está no final do
-[`agent.py`](agent.py), pronto para você preencher — **nada disso roda ainda**,
-é só o plano deixado no lugar certo.
+**Receber mensagens via webhook** — hoje conversamos pelo terminal. Um **webhook**
+é um endereço (endpoint) que recebe uma mensagem por HTTP e devolve a resposta.
+Além de abrir o agente para o mundo (site, WhatsApp), ele resolve um problema que
+o terminal **não** resolve: a **identidade** do usuário.
+
+### Identidade: por que o terminal não basta
+
+- **Identificação** = perguntar quem é você. **Autenticação** = provar quem é.
+- No terminal, se você `input()` o login (ou até um telefone), **não prova nada** —
+  qualquer um pode digitar o dado de outra pessoa. Não serve como identidade.
+- No **webhook**, o identificador (ex.: número de telefone) **chega na requisição,
+  vindo da plataforma** (WhatsApp/Telegram), que já validou aquele número. O
+  usuário não digita — logo, não forja. Por isso o `thread_id` costuma **ser** o
+  número: um identificador validado pela origem.
+- ⚠️ **Mas o webhook em si também precisa ser verificado:** a plataforma **assina**
+  a requisição com um segredo; seu código confere essa assinatura **antes** de
+  confiar no remetente. Sem isso, um impostor pode forjar a requisição. (Essa
+  validação depende de infraestrutura externa — conta na Meta/Twilio, URL pública.)
+
+### O endpoint (FastAPI)
+
+Instale as dependências e monte o agente **uma vez** (na subida do servidor); o
+endpoint só faz `invoke`. Arquivo `webhook.py`:
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+# ... (montagem única do agente + checkpointer, igual ao agent.py) ...
+
+app = FastAPI()
+
+class Mensagem(BaseModel):     # o FastAPI valida sozinho (falta de campo = erro 422)
+    de: str                    # identificador do remetente — VEM DO CANAL, não digitado
+    texto: str
+
+@app.post("/webhook")
+def receber(msg: Mensagem):
+    # PRODUÇÃO: verifique aqui a ASSINATURA da requisição antes de confiar no "de".
+    thread_id = msg.de.strip()                      # a identidade veio de fora
+    config = {"configurable": {"thread_id": thread_id}}
+    resultado = agente.invoke(
+        {"messages": [{"role": "user", "content": msg.texto}]}, config,
+    )
+    return {"resposta": resultado["messages"][-1].content}
+```
+
+Dependências e execução:
+
+```powershell
+uv add fastapi uvicorn
+uv run uvicorn webhook:app --reload
+```
+
+Teste sem ferramenta extra: o FastAPI cria uma página de testes automática em
+`http://127.0.0.1:8000/docs` (POST /webhook → Try it out). Mesmo `de` = mesma
+memória; `de` diferente = conversa isolada — é a base do multi-usuário.
+
+> Cada projeto tem sua **própria `.venv`**: instalar o FastAPI num projeto não o
+> instala em outro. Se der `ModuleNotFoundError: fastapi`, rode `uv add fastapi
+> uvicorn` **na pasta daquele projeto**.
 
 ---
 

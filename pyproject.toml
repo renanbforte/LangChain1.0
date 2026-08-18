@@ -38,4 +38,6 @@ dependencies = [
     "requests>=2.34.2",               # Cliente HTTP para tools que chamam APIs (ex.: ViaCEP).
     "langgraph-cli[inmem]>=0.4.31",   # Roda o LangGraph Studio local: `uv run langgraph dev`.
     "langchain-community>=0.4.2",     # SQLDatabaseToolkit (consulta o banco em linguagem natural).
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.3",
 ]
