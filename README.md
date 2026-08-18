@@ -531,6 +531,42 @@ Nós deixamos **as duas estratégias no código** ao mesmo tempo; você escolhe 
 > `trigger` certa conforme a estratégia. Existe também o parâmetro `keep`
 > (padrão: manter as 20 mensagens mais recentes intactas após o resumo).
 
+#### `trigger` × `keep` (a pegadinha mais comum) ⚠️
+
+São **dois** parâmetros independentes, e confundir os dois é o erro nº 1:
+
+- **`trigger`** = *QUANDO* resumir (o gatilho). Ex.: `("tokens", 2000)`.
+- **`keep`** = *QUANTO* manter intacto **depois** de resumir. Padrão: `("messages", 20)`.
+
+A pegadinha: se o `keep` for **maior** que o histórico atual, o `trigger` até dispara,
+mas **não sobra nada para resumir** — nenhum resumo é gerado. Ex.: `trigger=("messages", 6)`
+com o `keep` padrão de 20 → dispara aos 7, mas manda manter 20, então mantém tudo e
+não compacta nada.
+
+**Regra de ouro:** o `keep` tem que ser **bem menor** que o `trigger`, e o ideal é
+deixar os dois na **mesma unidade**:
+
+```python
+SummarizationMiddleware(
+    model="openai:gpt-3.5-turbo",
+    trigger=("tokens", 2000),   # resume quando passar de 2000 tokens
+    keep=("tokens", 500),       # mantém ~500 tokens recentes; o resto vira resumo
+)
+```
+
+Para **forçar** o resumo em um teste (poucas mensagens), use algo como
+`trigger=("messages", 6)` **junto com** `keep=("messages", 2)`.
+
+#### Onde VER o resumo gerado
+
+O resumo é inserido no histórico como uma mensagem cujo conteúdo começa com
+*"Here is a summary of the conversation to date:"* e fica salvo (em `jsonb`) na
+tabela `checkpoints`. As formas práticas de vê-lo:
+- **LangSmith:** o trace mostra o passo de sumarização e o texto gerado.
+- **Uma tabela própria `resumos`:** no loop, após o `invoke`, procure a mensagem
+  com aquele prefixo em `resultado["messages"]` e salve-a (com `ON CONFLICT` no
+  `mensagem_id` para não duplicar). Assim você lê os resumos em texto limpo.
+
 #### Como eu troco de estratégia (editando só o `.env`)
 
 Três variáveis no [`.env`](.env.example) controlam tudo (todas opcionais — se
