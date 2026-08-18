@@ -355,6 +355,16 @@ Até aqui, o agente **esquece** tudo quando o programa termina. Para ele
 **lembrar**, usamos um **checkpointer**: o componente do LangGraph que salva o
 estado da conversa. Vamos salvar no PostgreSQL com o `PostgresSaver`.
 
+> 💡 **Dica de aprendizado (o caminho que funciona melhor):** antes de configurar
+> o PostgreSQL, comece com uma memória **na RAM** para entender o conceito sem
+> nenhuma infraestrutura. Use `from langgraph.checkpoint.memory import InMemorySaver`
+> e `checkpointer = InMemorySaver()` (sem `.setup()` e sem `with`). O agente já
+> passa a lembrar **dentro da mesma execução** — teste dizendo seu nome e
+> perguntando em seguida. Depois, ao trocar para o `PostgresSaver`, a memória passa
+> a **sobreviver a fechar e reabrir** o programa. Assim você sente na prática a
+> diferença entre "memória na RAM" (some ao fechar) e "memória persistente" (fica
+> no banco).
+
 Dois conceitos novos:
 
 - **O bloco `with`**: o `PostgresSaver` abre uma conexão com o banco que precisa
@@ -916,6 +926,34 @@ mensagem amigável ao agente em vez de derrubar o programa. É a mesma lógica d
 timeout/HTTP/JSON compartilhada em `tools/_shared.py` — escrita **uma vez**, usada
 por todas as tools de API (princípio DRY: "não repita").
 
+### Resiliência: fallback entre fontes
+
+Quando uma tool depende de uma API que pode ficar instável ou limitar requisições
+(HTTP 429), vale ter uma **segunda fonte** que cobre a primeira. O padrão é simples:
+tente a fonte 1; se falhar, tente a fonte 2; só desista se **todas** falharem.
+
+```python
+def buscar_cnpj_service(cnpj):
+    fontes = [
+        f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}",   # 1ª tentativa
+        f"https://minhareceita.org/{cnpj}",               # fallback
+    ]
+    ultimo_erro = None
+    for url in fontes:                    # tenta cada fonte, em ordem
+        try:
+            return http_get_json(url)     # deu certo -> retorna e para
+        except ToolAPIError as e:
+            ultimo_erro = e               # falhou -> tenta a próxima
+    raise ToolAPIError(f"Nenhuma fonte respondeu. Último erro: {ultimo_erro}")
+```
+
+Dica: escolha fontes que devolvam os **mesmos nomes de campo** — assim o código de
+formatação não muda entre uma e outra. (Ex.: BrasilAPI e Minha Receita usam os
+mesmos campos: `razao_social`, `municipio`, `uf`…) E **verifique o endpoint real
+antes** de escrever a tool: a BrasilAPI, por exemplo, serve os dados sob `/api/`
+(`https://brasilapi.com.br/api/cnpj/v1/...`) — sem o `/api/` você recebe a página
+HTML do site, não o JSON.
+
 ### Quando isso vale a pena
 
 - **1–2 tools simples:** um arquivo só resolve; essa estrutura é exagero.
@@ -1175,6 +1213,47 @@ uv sync --link-mode=copy
 O console do Windows usa cp1252. Alguns comandos (ex.: `langgraph --help`) imprimem
 emoji e falham. Prefixe com `PYTHONIOENCODING=utf-8` (no PowerShell:
 `$env:PYTHONIOENCODING="utf-8"` antes do comando). Não afeta o agente em si.
+
+---
+
+## Problemas comuns ao construir o agente
+
+Tropeços que aparecem enquanto você monta o agente passo a passo (todos reais).
+
+### 5. Rodei o arquivo e não apareceu NADA (sem erro)
+
+O arquivo `.py` provavelmente está **vazio** (0 bytes). Rodar um arquivo vazio não
+dá erro — o Python abre, não acha nada e sai calado. Confirme que o código está
+salvo. E lembre do comando certo: `uv run python agente.py` (não `run agente.py`).
+
+### 6. `openai.BadRequestError` sobre `tool_calls` sem resposta
+
+Mensagem: *"An assistant message with 'tool_calls' must be followed by tool
+messages..."*. **Causa:** o histórico salvo daquela conversa (thread) ficou
+**inconsistente** — o agente pediu uma tool, mas a resposta da tool não foi salva.
+Acontece quando uma execução é **interrompida no meio de uma chamada de tool**
+(ex.: `Ctrl+C`) ou quando uma tool **crasha sem tratamento de erro**.
+
+**Correção rápida:** comece uma conversa nova, trocando o `thread_id` (ex.:
+`"conversa-1"` → `"conversa-2"`). **Correção definitiva:** use o middleware de
+tratamento de erro (`wrap_tool_call`) — com ele, uma falha de tool vira uma
+mensagem limpa e o histórico nunca fica "pendurado". E, para sair, digite `sair`
+em vez de `Ctrl+C`.
+
+### 7. Uma tool derruba o programa inteiro
+
+Se uma tool levanta uma exceção (rede, 429, dado inválido) **sem** o middleware de
+erro, o `agente.invoke(...)` propaga o erro e o programa cai. Adicione o
+`wrap_tool_call` em `create_agent(middleware=[...])`: a falha vira uma `ToolMessage`
+amigável, o agente responde com jeito e o programa continua vivo. Veja
+[Tratamento de erro central](#tratamento-de-erro-central).
+
+### 8. A API respondeu HTML em vez de JSON / erro de status
+
+Antes de escrever uma tool, **teste a URL da API de verdade** (com `requests` num
+script curto). Se vier HTML, o endereço provavelmente está incompleto (ex.: a
+BrasilAPI precisa de `/api/` no caminho). Se vier **HTTP 429**, é limite de
+requisições — espere um pouco ou use [fallback entre fontes](#resiliência-fallback-entre-fontes).
 
 ---
 
