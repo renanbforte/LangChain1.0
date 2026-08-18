@@ -226,6 +226,23 @@ uv sync
 - `uv sync` lê o `pyproject.toml`, cria a pasta `.venv` (o ambiente isolado) e
   baixa **todas** as bibliotecas listadas. Pode demorar um pouco na 1ª vez.
 
+> ⚠️ **Está no OneDrive? Use `uv sync --link-mode=copy`.** Se a pasta do projeto
+> estiver dentro do OneDrive (ou de outra pasta sincronizada na nuvem), o
+> `uv sync` normal FALHA com um erro tipo *"A operação de nuvem não pode ser
+> executada... links físicos incompatíveis (os error 396)"*. Motivo: o `uv`
+> usa *hardlinks* por padrão, e o OneDrive não suporta. A correção é mandar o
+> `uv` copiar em vez de "linkar":
+>
+> ```powershell
+> uv sync --link-mode=copy
+> ```
+>
+> Para não digitar isso toda vez, configure de uma vez (e reabra o terminal):
+> `setx UV_LINK_MODE copy`. **Melhor ainda:** mantenha projetos Python **fora**
+> do OneDrive (ex.: `C:\Users\voce\Projetos\...`) — evita esse erro e a
+> sincronização constante da `.venv`. Veja mais em
+> [Problemas comuns no Windows](#problemas-comuns-no-windows).
+
 ### 2.0.4 Criar o seu `.env` a partir do modelo
 
 ```powershell
@@ -1102,6 +1119,58 @@ O que cada um faz:
 > `git add README.md` — o `.` adiciona tudo que **não** está no `.gitignore`
 > (ou seja, tudo menos `.env`, `.venv/` e `__pycache__/`). Depois siga com
 > `git commit`, `git branch -M main`, `git remote add origin ...` e `git push`.
+
+---
+
+## Problemas comuns no Windows
+
+Erros reais que aparecem no dia a dia (Windows + PowerShell + uv) e como resolver.
+
+### 1. `uv sync` falha com "operação de nuvem / os error 396" (OneDrive)
+
+**Sintoma:** ao rodar `uv sync`, aparece algo como *"Failed to hardlink... A
+operação de nuvem não pode ser executada em um arquivo com links físicos
+incompatíveis. (os error 396)"* e a `.venv` fica incompleta.
+
+**Causa:** a pasta do projeto está dentro do **OneDrive**. O `uv` usa *hardlinks*
+por padrão; o OneDrive não suporta.
+
+**Correção:** apague a `.venv` quebrada e refaça em modo cópia:
+
+```powershell
+Remove-Item -Recurse -Force .venv
+uv sync --link-mode=copy
+```
+
+Para valer sempre: `setx UV_LINK_MODE copy` (e reabra o terminal). **Melhor:**
+mantenha o projeto **fora** do OneDrive (ex.: `C:\Users\voce\Projetos\...`).
+
+### 2. `ModuleNotFoundError` (ex.: "No module named 'jsonpatch'") ao importar
+
+**Causa mais comum:** a `.venv` está **corrompida ou foi copiada** de outra pasta.
+Venv **não é portátil** — ela guarda caminhos absolutos e não funciona se copiada.
+(Muitas vezes é o mesmo problema do OneDrive acima, que interrompeu a instalação.)
+
+**Correção:** recrie a `.venv` do zero (nunca copie a `.venv` entre pastas):
+
+```powershell
+Remove-Item -Recurse -Force .venv
+uv sync --link-mode=copy
+```
+
+### 3. "program not found" ou nada acontece ao rodar
+
+- `run agent.py` → **errado**: `run` sozinho não existe. Use `uv run`.
+- `uv run agent.py` → confira o **nome exato** do arquivo (é `agent.py`? `agente.py`?).
+- Forma correta: `uv run python agent.py`.
+- Se rodar e **não aparecer nada**, o arquivo pode estar **vazio** (0 bytes) —
+  rodar arquivo vazio não dá erro, só sai calado.
+
+### 4. Emojis/acentos quebrados no terminal (`UnicodeEncodeError`)
+
+O console do Windows usa cp1252. Alguns comandos (ex.: `langgraph --help`) imprimem
+emoji e falham. Prefixe com `PYTHONIOENCODING=utf-8` (no PowerShell:
+`$env:PYTHONIOENCODING="utf-8"` antes do comando). Não afeta o agente em si.
 
 ---
 
